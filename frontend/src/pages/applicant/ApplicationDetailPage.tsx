@@ -15,7 +15,7 @@ export function ApplicationDetailPage() {
   const editable = item.status === 'DRAFT' || item.status === 'RETURNED'
   return <><div className="page-title"><div><h1>申請詳細 #{item.id}</h1><StatusBadge status={item.status} /></div><Link className="button secondary" to="/applications">一覧へ戻る</Link></div>
     {error && <div className="alert error">{error}</div>}<div className="card"><ApplicationFields application={item} /></div>
-    <DocumentsCard applicationId={item.id} documents={item.documents ?? []} role="applicant" editable={editable} onChange={(documents) => setItem({ ...item, documents })} />
+    <DocumentsCard applicationId={item.id} documents={item.documents ?? []} role="applicant" />
     {editable && <div className="action-bar"><Link className="button secondary" to={`/applications/${item.id}/edit`}>編集</Link><button className="button danger" onClick={remove}>削除</button><button className="button primary" disabled={busy} onClick={submit}>{busy ? '提出中…' : '申請を提出'}</button></div>}
   </>
 }

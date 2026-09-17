@@ -76,6 +76,28 @@ class ApplicationWorkflowTest extends TestCase
         $this->putJson("/api/applications/{$application->id}", $this->payload())->assertStatus(409);
     }
 
+    public function test_applicant_can_attach_an_image_when_creating_an_application(): void
+    {
+        Storage::fake('local');
+        config(['filesystems.default' => 'local']);
+        $applicant = User::factory()->create(['role' => 'applicant']);
+        Sanctum::actingAs($applicant);
+
+        $response = $this->post('/api/applications', $this->payload() + [
+            'documents' => [UploadedFile::fake()->createWithContent(
+                'facility.png',
+                base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='),
+            )],
+        ], ['Accept' => 'application/json'])
+            ->assertCreated()
+            ->assertJsonPath('documents.0.original_name', 'facility.png')
+            ->assertJsonPath('documents.0.mime_type', 'image/png');
+
+        $document = ApplicationDocument::query()->firstOrFail();
+        $this->assertSame($response->json('id'), $document->application_id);
+        Storage::disk('local')->assertExists($document->path);
+    }
+
     public function test_roles_and_application_ownership_are_enforced(): void
     {
         $owner = User::factory()->create(['role' => 'applicant']);

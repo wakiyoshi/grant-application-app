@@ -8,6 +8,19 @@ export const clearToken = (role: Role) => localStorage.removeItem(tokenKey(role)
 export const hasToken = (role: Role) => Boolean(localStorage.getItem(tokenKey(role)))
 export const authHeaders = (role: Role) => ({ Authorization: `Bearer ${localStorage.getItem(tokenKey(role))}` })
 
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (axios.isAxiosError(error) && error.response?.status === 401) {
+      const role: Role = error.config?.url?.startsWith('/reviewer/') ? 'reviewer' : 'applicant'
+      const loginPath = role === 'reviewer' ? '/reviewer/login' : '/login'
+      clearToken(role)
+      if (window.location.pathname !== loginPath) window.location.assign(loginPath)
+    }
+    return Promise.reject(error)
+  },
+)
+
 export function errorMessage(error: unknown): string {
   if (axios.isAxiosError(error)) {
     const errors = error.response?.data?.errors as Record<string, string[]> | undefined

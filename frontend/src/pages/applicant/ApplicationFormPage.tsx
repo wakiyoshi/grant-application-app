@@ -1,19 +1,53 @@
-import { type FormEvent, useEffect, useState } from 'react'
+import { type FormEvent, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { api, authHeaders, errorMessage } from '../../api/client'
 import type { ApplicationInput } from '../../types/application'
 
 const emptyForm: ApplicationInput = { corporation_name: '', corporation_number: '', medical_institution_name: '', contact_name: '', email: '', amount: 0, description: '' }
 
+function SelectedImagePreview({ file }: { file: File }) {
+  const imageRef = useRef<HTMLImageElement>(null)
+
+  useEffect(() => {
+    const objectUrl = URL.createObjectURL(file)
+    if (imageRef.current) imageRef.current.src = objectUrl
+    return () => URL.revokeObjectURL(objectUrl)
+  }, [file])
+
+  return <img ref={imageRef} alt={`${file.name}のプレビュー`} />
+}
+
 export function ApplicationFormPage() {
   const { id } = useParams(); const editing = Boolean(id); const navigate = useNavigate()
   const [form, setForm] = useState<ApplicationInput>(emptyForm); const [error, setError] = useState(''); const [busy, setBusy] = useState(false)
+  const [documents, setDocuments] = useState<File[]>([])
   useEffect(() => { if (id) api.get(`/applications/${id}`, { headers: authHeaders('applicant') }).then(({ data }) => setForm(data)).catch((e) => setError(errorMessage(e))) }, [id])
   function field(name: keyof ApplicationInput, value: string) { setForm((current) => ({ ...current, [name]: name === 'amount' ? Number(value) : value })) }
   async function submit(event: FormEvent) {
     event.preventDefault(); setBusy(true); setError('')
-    try { const response = editing ? await api.put(`/applications/${id}`, form, { headers: authHeaders('applicant') }) : await api.post('/applications', form, { headers: authHeaders('applicant') }); navigate(`/applications/${response.data.id}`) }
+    try {
+      if (editing) {
+        const response = await api.put(`/applications/${id}`, form, { headers: authHeaders('applicant') })
+        navigate(`/applications/${response.data.id}`)
+      } else {
+        const payload = new FormData()
+        Object.entries(form).forEach(([name, value]) => payload.append(name, String(value)))
+        documents.forEach((file) => payload.append('documents[]', file))
+        const response = await api.post('/applications', payload, { headers: authHeaders('applicant') })
+        navigate(`/applications/${response.data.id}`)
+      }
+    }
     catch (e) { setError(errorMessage(e)) } finally { setBusy(false) }
+  }
+  function selectDocuments(files: FileList | null) {
+    const selected = Array.from(files ?? [])
+    if (selected.length > 5) {
+      setDocuments([])
+      setError('添付できる画像・書類は最大5ファイルです。')
+      return
+    }
+    setError('')
+    setDocuments(selected)
   }
   return <><div className="page-title"><div><h1>{editing ? '申請を編集' : '新規申請'}</h1><p>すべての項目を入力してください。</p></div></div>
     {error && <div className="alert error pre-wrap">{error}</div>}
@@ -25,6 +59,16 @@ export function ApplicationFormPage() {
       <label>メールアドレス<input type="email" value={form.email} onChange={(e) => field('email', e.target.value)} required /></label>
       <label>申請金額（円）<input type="number" min="1" value={form.amount || ''} onChange={(e) => field('amount', e.target.value)} required /></label>
       <label className="full">申請内容<textarea rows={8} value={form.description} onChange={(e) => field('description', e.target.value)} maxLength={10000} required /></label>
+      {!editing && <div className="full new-application-upload">
+        <label>添付画像・書類（任意）<input type="file" accept=".pdf,.jpg,.jpeg,.png,.webp" multiple onChange={(event) => selectDocuments(event.target.files)} /></label>
+        <p>PDF・JPEG・PNG・WebP、1ファイル10MBまで、最大5ファイル</p>
+        {documents.length > 0 && <div className="selected-documents">
+          {documents.map((file) => <div key={`${file.name}-${file.lastModified}`} className="selected-document">
+            {file.type.startsWith('image/') && <SelectedImagePreview file={file} />}
+            <span>{file.name}</span>
+          </div>)}
+        </div>}
+      </div>}
       <div className="form-actions full"><Link className="button secondary" to={editing ? `/applications/${id}` : '/applications'}>キャンセル</Link><button className="button primary" disabled={busy}>{busy ? '保存中…' : '保存'}</button></div>
     </form>
   </>

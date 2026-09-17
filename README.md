@@ -49,15 +49,15 @@
 
 - `/login`: ログイン
 - `/applications`: 申請一覧
-- `/applications/new`: 新規申請
-- `/applications/:id`: 申請詳細、書類アップロード/ダウンロード/削除、提出
+- `/applications/new`: 新規申請、画像・書類添付
+- `/applications/:id`: 申請詳細、添付画像プレビュー、書類ダウンロード、提出
 - `/applications/:id/edit`: 申請編集
 
 審査担当者:
 
 - `/reviewer/login`: 審査担当者ログイン
 - `/reviewer/applications`: 審査一覧
-- `/reviewer/applications/:id`: 審査詳細、書類ダウンロード、承認、差戻し
+- `/reviewer/applications/:id`: 審査詳細、添付画像プレビュー、書類ダウンロード、承認、差戻し
 
 ## API一覧
 
@@ -66,7 +66,7 @@
 | GET | `/api/health` | 不要 | ALB/ECSヘルスチェック |
 | POST | `/api/login` | 不要 | 申請者ログイン |
 | POST | `/api/logout` | 申請者 | 申請者ログアウト |
-| GET/POST | `/api/applications` | 申請者 | 自分の申請一覧/作成 |
+| GET/POST | `/api/applications` | 申請者 | 自分の申請一覧/作成（作成時に`documents[]`を添付可能） |
 | GET/PUT/DELETE | `/api/applications/{id}` | 申請者 | 自分の申請詳細/編集/削除 |
 | POST | `/api/applications/{id}/submit` | 申請者 | 申請提出 |
 | POST | `/api/applications/{id}/documents` | 申請者 | 申請書類アップロード |

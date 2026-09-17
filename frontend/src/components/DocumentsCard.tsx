@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api, authHeaders, errorMessage, type Role } from '../api/client'
 import type { ApplicationDocument } from '../types/application'
 
@@ -6,30 +6,32 @@ interface Props {
   applicationId: number
   documents: ApplicationDocument[]
   role: Role
-  editable?: boolean
-  onChange?: (documents: ApplicationDocument[]) => void
 }
 
-export function DocumentsCard({ applicationId, documents, role, editable = false, onChange }: Props) {
-  const inputRef = useRef<HTMLInputElement>(null)
-  const [files, setFiles] = useState<File[]>([])
-  const [busy, setBusy] = useState(false)
+function ImagePreview({ path, name, role }: { path: string, name: string, role: Role }) {
+  const [url, setUrl] = useState('')
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    let objectUrl = ''
+    api.get(path, { headers: authHeaders(role), responseType: 'blob' }).then(({ data }) => {
+      objectUrl = URL.createObjectURL(data)
+      if (active) setUrl(objectUrl)
+      else URL.revokeObjectURL(objectUrl)
+    }).catch(() => { if (active) setFailed(true) })
+    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl) }
+  }, [path, role])
+
+  if (failed) return <div className="document-preview placeholder error-text">プレビューを表示できません</div>
+  return url ? <a className="document-preview-link" href={url} target="_blank" rel="noreferrer" title="画像を拡大表示">
+    <img className="document-preview" src={url} alt={`${name}のプレビュー`} />
+  </a> : <div className="document-preview placeholder">読込中</div>
+}
+
+export function DocumentsCard({ applicationId, documents, role }: Props) {
   const [error, setError] = useState('')
   const basePath = role === 'reviewer' ? `/reviewer/applications/${applicationId}` : `/applications/${applicationId}`
-
-  async function upload() {
-    if (!files.length) return
-    setBusy(true); setError('')
-    const form = new FormData()
-    files.forEach((file) => form.append('documents[]', file))
-    try {
-      const { data } = await api.post<ApplicationDocument[]>(`${basePath}/documents`, form, { headers: authHeaders(role) })
-      onChange?.([...documents, ...data])
-      setFiles([])
-      if (inputRef.current) inputRef.current.value = ''
-    } catch (e) { setError(errorMessage(e)) }
-    finally { setBusy(false) }
-  }
 
   async function download(document: ApplicationDocument) {
     setError('')
@@ -42,26 +44,14 @@ export function DocumentsCard({ applicationId, documents, role, editable = false
     } catch (e) { setError(errorMessage(e)) }
   }
 
-  async function remove(documentId: number) {
-    if (!confirm('この書類を削除しますか？')) return
-    setError('')
-    try {
-      await api.delete(`${basePath}/documents/${documentId}`, { headers: authHeaders(role) })
-      onChange?.(documents.filter((document) => document.id !== documentId))
-    } catch (e) { setError(errorMessage(e)) }
-  }
-
   return <div className="card documents-card">
-    <h2>申請書類</h2>
+    <h2>添付画像・書類</h2>
     {error && <div className="alert error pre-wrap">{error}</div>}
     {documents.length ? <ul className="document-list">{documents.map((document) => <li key={document.id}>
-      <div><strong>{document.original_name}</strong><small>{(document.size / 1024 / 1024).toFixed(2)} MB</small></div>
-      <div className="document-actions"><button className="button secondary" onClick={() => download(document)}>ダウンロード</button>{editable && <button className="button danger" onClick={() => remove(document.id)}>削除</button>}</div>
-    </li>)}</ul> : <p className="empty compact">添付書類はありません。</p>}
-    {editable && <div className="upload-box">
-      <input ref={inputRef} type="file" accept=".pdf,.jpg,.jpeg,.png,.webp" multiple onChange={(event) => setFiles(Array.from(event.target.files ?? []))} />
-      <p>PDF・JPEG・PNG・WebP、1ファイル10MBまで、最大5ファイル</p>
-      <button className="button primary" disabled={!files.length || busy} onClick={upload}>{busy ? 'アップロード中…' : 'アップロード'}</button>
-    </div>}
+      <div className="document-info">{document.mime_type.startsWith('image/') && <ImagePreview path={`${basePath}/documents/${document.id}`} name={document.original_name} role={role} />}
+        <div><strong>{document.original_name}</strong><small>{(document.size / 1024 / 1024).toFixed(2)} MB</small></div>
+      </div>
+      <div className="document-actions"><button className="button secondary" onClick={() => download(document)}>ダウンロード</button></div>
+    </li>)}</ul> : <p className="empty compact">添付画像・書類はありません。</p>}
   </div>
 }

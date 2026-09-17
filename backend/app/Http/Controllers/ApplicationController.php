@@ -9,6 +9,8 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Throwable;
 
 class ApplicationController extends Controller
 {
@@ -24,11 +26,45 @@ class ApplicationController extends Controller
 
     public function store(Request $request): JsonResponse
     {
-        $application = $request->user()->applications()->create(
-            $this->validatedApplication($request) + ['status' => ApplicationStatus::Draft]
-        );
+        $applicationData = $this->validatedApplication($request);
+        $documentData = $request->validate([
+            'documents' => ['sometimes', 'array', 'max:5'],
+            'documents.*' => ['required', 'file', 'mimes:pdf,jpg,jpeg,png,webp', 'max:10240'],
+        ]);
+        $disk = config('filesystems.default');
+        $storedPaths = [];
 
-        return response()->json($application, 201);
+        try {
+            $application = DB::transaction(function () use ($request, $applicationData, $documentData, $disk, &$storedPaths) {
+                $application = $request->user()->applications()->create(
+                    $applicationData + ['status' => ApplicationStatus::Draft]
+                );
+
+                foreach ($documentData['documents'] ?? [] as $file) {
+                    $filename = Str::uuid().'.'.$file->extension();
+                    $path = Storage::disk($disk)->putFileAs("applications/{$application->id}", $file, $filename);
+                    abort_if($path === false, 500, '書類を保存できませんでした。');
+                    $storedPaths[] = $path;
+
+                    $application->documents()->create([
+                        'disk' => $disk,
+                        'path' => $path,
+                        'original_name' => $file->getClientOriginalName(),
+                        'mime_type' => $file->getMimeType() ?: 'application/octet-stream',
+                        'size' => $file->getSize(),
+                    ]);
+                }
+
+                return $application;
+            });
+        } catch (Throwable $exception) {
+            foreach ($storedPaths as $path) {
+                Storage::disk($disk)->delete($path);
+            }
+            throw $exception;
+        }
+
+        return response()->json($application->load('documents'), 201);
     }
 
     public function show(Request $request, int $id): JsonResponse
