@@ -1,0 +1,242 @@
+# 検証済みバックエンドイメージを一つ上の環境へ昇格するワークフロー
+name: Promote
+
+# 昇格先だけを指定して手動実行する
+on:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: Promotion target (dev→stg / stg→prod)
+        required: true
+        type: choice
+        options: [stg, prod]
+
+# 選択した対象環境への昇格を同時に一つだけ実行する
+concurrency:
+  group: promote-${{ inputs.target_environment }}
+  cancel-in-progress: false
+
+# AWS OIDC認証に必要な最小権限
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  # stgへ昇格する場合はdev、prodへ昇格する場合はstgを直前環境として検証する
+  verify-source:
+    name: Verify image in previous environment
+    runs-on: ubuntu-latest
+    # 直前環境のVariablesとOIDC subjectを使用する
+    environment: ${{ inputs.target_environment == 'stg' && 'dev' || 'stg' }}
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      ECS_CONTAINER: ${{ vars.ECS_CONTAINER }}
+    outputs:
+      # 対象環境へ渡すのはタグではなく、内容が変わらないdigest URI
+      image_uri: ${{ steps.source.outputs.image_uri }}
+    steps:
+      # 直前環境の確認に必要な変数が設定されていることを確認する
+      - name: Validate source variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in AWS_ROLE_ARN AWS_REGION ECS_CLUSTER ECS_SERVICE ECS_CONTAINER; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "GitHub variable ${variable} is required." >&2
+              exit 1
+            fi
+          done
+
+      # 直前環境のAWSへOIDCで接続する
+      - name: Configure source AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 直前環境で安定稼働中のタスクから、昇格対象のdigest URIを自動取得する
+      - name: Verify source deployment
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          service_json="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --output json)"
+          if [[ "$(jq '.failures | length' <<< "$service_json")" -ne 0 ]] || \
+             [[ "$(jq '.services | length' <<< "$service_json")" -ne 1 ]]; then
+            echo "The source ECS service could not be resolved." >&2
+            exit 1
+          fi
+
+          task_definition="$(jq -r '.services[0].taskDefinition' <<< "$service_json")"
+          rollout_state="$(jq -r '.services[0].deployments[] | select(.status == "PRIMARY") | .rolloutState // "UNKNOWN"' <<< "$service_json")"
+          deployed_image="$(aws ecs describe-task-definition \
+            --task-definition "$task_definition" \
+            --query "taskDefinition.containerDefinitions[?name=='${ECS_CONTAINER}'].image | [0]" \
+            --output text)"
+
+          if [[ "$rollout_state" != "COMPLETED" ]]; then
+            echo "The source environment deployment is not complete." >&2
+            exit 1
+          fi
+
+          # タグではなくECR digestで固定されたイメージだけを昇格対象として認める
+          if [[ ! "$deployed_image" =~ ^[0-9]{12}\.dkr\.ecr\.[^.]+\.amazonaws\.com(\.cn)?/.+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "The source task does not use a digest-pinned ECR image: ${deployed_image}" >&2
+            exit 1
+          fi
+
+          echo "image_uri=${deployed_image}" >> "$GITHUB_OUTPUT"
+
+  # 直前環境で確認できた同じdigestを、再buildせず対象環境へ反映する
+  promote:
+    name: Promote image to ${{ inputs.target_environment }}
+    needs: verify-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.target_environment }}
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      ECS_CONTAINER: ${{ vars.ECS_CONTAINER }}
+      # verify-sourceが確認したDEV ECRの同一digestをそのまま使用する
+      IMAGE_URI: ${{ needs.verify-source.outputs.image_uri }}
+    steps:
+      # 昇格先への反映に必要な変数が設定されていることを確認する
+      - name: Validate target variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in AWS_ROLE_ARN AWS_REGION ECS_CLUSTER ECS_SERVICE ECS_CONTAINER IMAGE_URI; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "GitHub variable ${variable} is required." >&2
+              exit 1
+            fi
+          done
+
+      # 昇格先環境のAWSへOIDCで接続する
+      - name: Configure target AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 昇格先の最新基本設定を引き継ぎ、コンテナイメージだけを差し替える
+      - name: Register promoted task definition
+        id: task-definition
+        shell: bash
+        run: |
+          set -euo pipefail
+          service_json="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --output json)"
+          if [[ "$(jq '.failures | length' <<< "$service_json")" -ne 0 ]] || \
+             [[ "$(jq '.services | length' <<< "$service_json")" -ne 1 ]]; then
+            echo "The target ECS service could not be resolved." >&2
+            exit 1
+          fi
+
+          current_task_definition="$(jq -r '.services[0].taskDefinition' <<< "$service_json")"
+          current_task_definition_json="$(aws ecs describe-task-definition \
+            --task-definition "$current_task_definition" \
+            --output json)"
+          task_family="$(jq -r '.taskDefinition.family' <<< "$current_task_definition_json")"
+          base_task_definition="$(aws ecs list-task-definitions \
+            --family-prefix "$task_family" \
+            --status ACTIVE \
+            --sort DESC \
+            --max-items 1 \
+            --query 'taskDefinitionArns[0]' \
+            --output text)"
+          if [[ "$base_task_definition" != arn:aws*:ecs:*:task-definition/*:* ]]; then
+            echo "The latest target task definition could not be resolved." >&2
+            exit 1
+          fi
+
+          aws ecs describe-task-definition \
+            --task-definition "$base_task_definition" \
+            --include TAGS \
+            --output json > task-definition-response.json
+          jq '.taskDefinition + {tags: (.tags // [])}' \
+            task-definition-response.json > task-definition.json
+
+          if ! jq -e --arg container "$ECS_CONTAINER" \
+            '[.containerDefinitions[] | select(.name == $container)] | length == 1' \
+            task-definition.json > /dev/null; then
+            echo "Container ${ECS_CONTAINER} was not found exactly once." >&2
+            exit 1
+          fi
+
+          jq --arg container "$ECS_CONTAINER" --arg image "$IMAGE_URI" '
+            del(
+              .taskDefinitionArn,
+              .revision,
+              .status,
+              .requiresAttributes,
+              .compatibilities,
+              .registeredAt,
+              .registeredBy,
+              .deregisteredAt
+            )
+            | .containerDefinitions |= map(
+                if .name == $container then .image = $image else . end
+              )
+          ' task-definition.json > task-definition-new.json
+
+          task_definition_arn="$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition-new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)"
+          if [[ "$task_definition_arn" != arn:aws*:ecs:*:task-definition/*:* ]]; then
+            echo "ECS did not return a valid task definition ARN." >&2
+            exit 1
+          fi
+          echo "arn=${task_definition_arn}" >> "$GITHUB_OUTPUT"
+
+      # 新しいrevisionをECSサービスへ反映して安定状態まで待つ
+      - name: Deploy promoted image
+        env:
+          TASK_DEFINITION_ARN: ${{ steps.task-definition.outputs.arn }}
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$TASK_DEFINITION_ARN"
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+
+      # 昇格先が同じタスク定義と同じイメージdigestで稼働していることを確認する
+      - name: Verify promoted deployment
+        env:
+          EXPECTED_TASK_DEFINITION_ARN: ${{ steps.task-definition.outputs.arn }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          service_json="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --output json)"
+          actual_task_definition="$(jq -r '.services[0].taskDefinition' <<< "$service_json")"
+          primary_task_definition="$(jq -r '.services[0].deployments[] | select(.status == "PRIMARY") | .taskDefinition' <<< "$service_json")"
+          rollout_state="$(jq -r '.services[0].deployments[] | select(.status == "PRIMARY") | .rolloutState // "UNKNOWN"' <<< "$service_json")"
+          deployed_image="$(aws ecs describe-task-definition \
+            --task-definition "$actual_task_definition" \
+            --query "taskDefinition.containerDefinitions[?name=='${ECS_CONTAINER}'].image | [0]" \
+            --output text)"
+
+          if [[ "$actual_task_definition" != "$EXPECTED_TASK_DEFINITION_ARN" ]] || \
+             [[ "$primary_task_definition" != "$EXPECTED_TASK_DEFINITION_ARN" ]] || \
+             [[ "$rollout_state" != "COMPLETED" ]] || \
+             [[ "$deployed_image" != "$IMAGE_URI" ]]; then
+            echo "The promoted ECS deployment did not complete with the expected image." >&2
+            exit 1
+          fi

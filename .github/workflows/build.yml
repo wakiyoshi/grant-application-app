@@ -1,0 +1,159 @@
+# CIとデプロイ用成果物の作成を担当するワークフロー
+name: Build
+
+# Pull RequestではCI、mainへのpushではCIと成果物公開を実行する
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# ソースコードの取得に必要な最小権限
+permissions:
+  contents: read
+
+jobs:
+  # フロントエンドの静的検査と本番ビルドを実行する
+  frontend:
+    name: Lint and build frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      # 対象コミットを取得する
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Node.jsとnpmキャッシュを準備する
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # lockファイルどおりに依存パッケージをインストールする
+      - name: Install dependencies
+        run: npm ci
+
+      # ESLintなどの静的検査を実行する
+      - name: Lint
+        run: npm run lint
+
+      # S3へ配信する本番用distを生成する
+      - name: Build
+        run: npm run build
+
+      # mainへのpush時だけ、DEVデプロイが利用するdistを保存する
+      - name: Upload frontend artifact
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+          retention-days: 7
+
+  # Laravelバックエンドの自動テストを実行する
+  backend-test:
+    name: Test backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      # 対象コミットを取得する
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # LaravelとSQLiteテストに必要なPHP環境を準備する
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, pdo_sqlite
+          coverage: none
+
+      # composer.lockどおりに依存パッケージをインストールする
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      # Laravelのテスト実行に必要な環境ファイルとAPP_KEYを準備する
+      - name: Prepare test environment
+        run: cp .env.example .env && php artisan key:generate
+
+      # composer.jsonに定義されたPHPUnitテストを実行する
+      - name: Run tests
+        run: composer test
+
+  # mainのCI成功後、バックエンドイメージを一度だけ作成してDEV ECRへ保存する
+  backend-image:
+    name: Build and publish backend image
+    if: github.event_name == 'push'
+    needs: [frontend, backend-test]
+    runs-on: ubuntu-latest
+    # DEV環境のVariablesとOIDC subjectを使用する
+    environment: dev
+    permissions:
+      contents: read
+      # GitHub OIDCでAWS IAM Roleを引き受けるために必要
+      id-token: write
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+    steps:
+      # Docker build対象を含むソースコードを取得する
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # 必須のDEV環境変数が設定されていることを確認する
+      - name: Validate build variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in AWS_ROLE_ARN AWS_REGION ECR_REPOSITORY; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "GitHub variable ${variable} is required." >&2
+              exit 1
+            fi
+          done
+
+      # OIDCでDEV用AWS Roleへ接続する
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # DockerがDEV ECRへpushできるようログインする
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # commit SHAをタグにしてイメージをbuildし、ECRへpushする
+      - name: Build and push image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_uri="${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          docker build --tag "$image_uri" backend
+          docker push "$image_uri"
+
+      # ECRへの反映と、タグに対応するdigestを確認する
+      - name: Verify published image
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(aws ecr describe-images \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageTag="$GITHUB_SHA" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+          if [[ "$digest" != sha256:* ]]; then
+            echo "Could not resolve an image digest for ${GITHUB_SHA}." >&2
+            exit 1
+          fi
+          echo "Published backend image ${GITHUB_SHA} as ${digest}."

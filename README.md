@@ -38,8 +38,9 @@
 │   ├── tests/
 │   └── Dockerfile
 ├── .github/workflows/
-│   ├── application.yml
-│   └── promote-backend.yml
+│   ├── build.yml
+│   ├── deploy.yml
+│   └── promotion.yml
 └── docker-compose.yml
 ```
 
@@ -63,7 +64,7 @@
 
 | Method | Path | 認証 | 用途 |
 |---|---|---|---|
-| GET | `/api/health` | 不要 | ALB/ECSヘルスチェック |
+| GET | `/health` | 不要 | ALB/ECSヘルスチェック |
 | POST | `/api/login` | 不要 | 申請者ログイン |
 | POST | `/api/logout` | 申請者 | 申請者ログアウト |
 | GET/POST | `/api/applications` | 申請者 | 自分の申請一覧/作成（作成時に`documents[]`を添付可能） |
@@ -135,7 +136,7 @@ npm run dev
 ```
 
 - Frontend: `http://localhost:5173`
-- Backend health: `http://localhost:8000/api/health`
+- Backend health: `http://localhost:8000/health`
 - MailHog: `http://localhost:8025`
 - 申請者: `applicant@example.com` / `password`
 - 審査担当者: `reviewer@example.com` / `password`
@@ -158,7 +159,7 @@ Backendのコードや`composer.lock`を変更した場合は、`docker compose 
 
 ## Docker構成
 
-`backend/Dockerfile`はComposer依存解決とPHP 8.4 + Apache実行環境のmulti-stage buildです。DocumentRootはLaravelの`public/`、待受ポートは80です。アプリイメージはmigrationを自動実行しません。デプロイ時に1回限りのECS Task等で次を実行してください。
+`backend/Dockerfile`はComposer依存解決とPHP 8.4 + Apache実行環境のmulti-stage buildです。DocumentRootはLaravelの`public/`、待受ポートは8080です。アプリイメージは起動時にmigrationを実行しません。DEVではDeploy Workflowが常駐Service更新前に1回限りのECS Taskで次を実行します。
 
 ```bash
 php artisan migrate --force
@@ -170,10 +171,11 @@ php artisan migrate --force
 
 | 変数 | 用途 |
 |---|---|
-| `APP_NAME`, `APP_ENV`, `APP_KEY`, `APP_DEBUG`, `APP_URL` | Laravel基本設定。`APP_KEY`は必ずSecrets Manager等から注入 |
+| `APP_NAME`, `APP_ENV`, `APP_KEY`, `APP_DEBUG`, `APP_URL`, `APP_PORT` | Laravel基本設定。DEVの`APP_PORT`は`8080`、`APP_KEY`は必ずSecrets Manager等から注入 |
 | `LOG_CHANNEL`, `LOG_LEVEL` | CloudWatchへ出す場合は`stderr`推奨 |
-| `DB_CONNECTION` | `mysql` |
-| `DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD` | Aurora/RDS接続情報 |
+| `DB_ENGINE` / `DB_CONNECTION` | `mysql`。どちらの名前でも指定可能 |
+| `DB_HOST`, `DB_PORT`, `DB_NAME` / `DB_DATABASE`, `DB_CHARSET`, `DB_TIMEZONE` | Aurora/RDS接続情報。DB名はどちらの名前でも指定可能 |
+| `DB_USERNAME`, `DB_PASSWORD` | Secrets Manager経由で注入するDB認証情報 |
 | `FILESYSTEM_DISK` | ローカルは`local`、AWSは`s3` |
 | `AWS_BUCKET` | 既存Terraformで作成した申請書類用S3バケット名 |
 | `MAIL_MAILER` | Docker Composeは`smtp`、AWSは`ses` |
@@ -189,33 +191,32 @@ Frontendは同一CloudFront Distributionの`/api/*`を使用するため、AWS�
 
 ## CI/CD
 
-- Pull Request: Frontend lint/build、Backend test
-- `main` push: 上記完了後、FrontendをDEV S3へsyncしてCloudFront invalidation、Backend imageをECRへpushしてDEV ECS Task Definitionを更新
-- STG/PROD: `Promote backend image`を手動実行し、DEVで検証済みのcommit SHA imageを再buildせず昇格
+- `build.yml`: Pull RequestではFrontend lint/buildとBackend testを実行する。`main` pushでは、同じ検査に加えてFrontend成果物を保存し、Backend imageを一度だけbuildしてcommit SHAタグでDEV ECRへpushする
+- `deploy.yml`: `build.yml`の成功後、保存済みFrontend成果物をDEV S3/CloudFrontへ配信する。Backendは同じcommit SHAのimageを使ってmigrationを実行し、成功後にdigest固定でDEV ECSを1台へ更新する。ここでは再buildしない
+- `promotion.yml`: 昇格先だけを指定して手動実行する。STGを選ぶとDEVで稼働中のimageを、PRODを選ぶとSTGで稼働中の同じimageを自動取得して昇格する。昇格時には再buildしない
 
 GitHub Environments `dev`、`stg`、`prod`へ以下を設定します。STG/PRODには承認ルールを推奨します。
 
-Secret:
+各Environment用Variables:
 
-- `AWS_ROLE_ARN`: GitHub OIDCでAssumeする環境別IAM Role
+- `AWS_ROLE_ARN`: GitHub OIDCでAssumeする環境別IAM Role ARN
+- `AWS_REGION`, `ECS_CLUSTER`, `ECS_SERVICE`, `ECS_CONTAINER`
+- DEVのみ: `ECR_REPOSITORY`, `FRONTEND_BUCKET`, `CLOUDFRONT_DISTRIBUTION_ID`
 
-Variables:
-
-- 共通Backend: `AWS_REGION`, `ECR_REPOSITORY`, `ECS_CLUSTER`, `ECS_SERVICE`, `ECS_TASK_DEFINITION`, `ECS_CONTAINER_NAME`
-- DEV Frontend: `FRONTEND_BUCKET`, `CLOUDFRONT_DISTRIBUTION_ID`
+各WorkflowはAccess Key/Secret Access Keyを使用しません。IAM権限とOIDC Trust Policyの例は`docs/deploy-dev-iam.md`を参照してください。STG/PRODのECS Task Execution Roleには、DEV ECRの同じdigest imageをpullできる権限が必要です。
 
 ## AWSデプロイ前の設定
 
 1. CloudFrontの`/*`をS3、`/api/*`をALBへ設定する。
 2. `/api/*`は全必要HTTP methodを許可し、`Authorization`/`Accept`/`Content-Type`をALBへ転送し、キャッシュを無効化する。
 3. SPAの直接アクセス用にCloudFrontの403/404を`/index.html`へマッピングする。
-4. ALB Target Groupのhealth check pathを`/api/health`、success codeを200、ECS container portを80にする。
+4. ALB Target Groupのhealth check pathを`/health`、success codeを200、ECS container portを8080にする。
 5. ECS Task DefinitionからDB情報、`APP_KEY`等をSecrets Manager/環境変数で渡し、ログをCloudWatch Logsへ送る。
-6. `FILESYSTEM_DISK=s3`と`AWS_BUCKET`を設定し、ECS Task Roleへ申請書類prefixに限定した`GetObject`、`PutObject`、`DeleteObject`権限を付与する。Applicationはバケットを作成しない。
+6. `FILESYSTEM_DISK=s3`と`AWS_BUCKET`を設定し、ECS Task Roleへ申請書類Bucketに限定した`ListBucket`、`GetObject`、`PutObject`、`DeleteObject`権限を付与する。Applicationはバケットを作成しない。
 7. `MAIL_MAILER=ses`、`MAIL_FROM_ADDRESS=no-reply@waki-cloud-lab.com`を設定する。ECS Task Roleへ対象identityに限定したSES送信権限を付与し、SESで`waki-cloud-lab.com`ドメインを検証する。SES sandbox中は宛先も検証が必要。
 8. Aurora/RDSのDBとユーザーを用意し、ECSからSecurity Group経由で接続可能にする。
-9. 初回/各リリース前にmigration用の一時ECS Taskを実行する。常駐Taskの同時起動時migrationは避ける。
+9. 初回/各リリース前にDeploy Workflowがmigration用の一時ECS Taskを実行できる権限を付与する。常駐Taskの同時起動時migrationは避ける。
 10. GitHub OIDC provider/IAM Roleと上記GitHub Environment値を設定する。
 11. CloudFrontのAlternate Domain Nameと証明書を`waki-cloud-lab.com`へ設定し、CloudFrontからALBへのHTTPS・オリジン制限を既存Terraform側で確認する。
 
-このリポジトリからTerraform apply、ECR/ECS/S3へのデプロイ、SES実送信は行いません。
+Terraform applyとSES実送信はこのリポジトリのWorkflowでは行いません。

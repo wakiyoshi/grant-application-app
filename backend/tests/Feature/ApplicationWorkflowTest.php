@@ -114,7 +114,7 @@ class ApplicationWorkflowTest extends TestCase
 
     public function test_health_endpoint_is_public(): void
     {
-        $this->getJson('/api/health')->assertOk()->assertJsonPath('status', 'ok');
+        $this->get('/health')->assertOk();
     }
 
     /** @return array<string, mixed> */

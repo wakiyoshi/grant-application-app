@@ -6,12 +6,6 @@ use App\Http\Controllers\AuthController;
 use App\Http\Controllers\ReviewerApplicationController;
 use Illuminate\Support\Facades\Route;
 
-Route::get('/health', fn () => response()->json([
-    'status' => 'ok',
-    'environment' => app()->environment(),
-    'timestamp' => now()->toIso8601String(),
-]));
-
 Route::post('/login', [AuthController::class, 'applicantLogin']);
 Route::post('/reviewer/login', [AuthController::class, 'reviewerLogin']);
 

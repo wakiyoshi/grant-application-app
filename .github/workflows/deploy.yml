@@ -1,0 +1,298 @@
+# Buildワークフローの成果物をDEVへ配信するワークフロー
+name: Deploy DEV
+
+# mainで完了したBuildワークフローを起点にする
+on:
+  workflow_run:
+    workflows: [Build]
+    branches: [main]
+    types: [completed]
+
+# 同じDEV環境への古いデプロイを、新しい実行が追い越さないよう制御する
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: true
+
+# Build実行のartifact取得とAWS OIDC認証に必要な権限
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+jobs:
+  # Buildがmainへのpushで成功した場合だけフロントエンドを配信する
+  frontend:
+    name: Deploy frontend to DEV
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      FRONTEND_BUCKET: ${{ vars.FRONTEND_BUCKET }}
+      CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+    steps:
+      # build.ymlが生成した同じcommitのdistを取得し、ここでは再buildしない
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend-dist
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      # 必須のDEV環境変数が設定されていることを確認する
+      - name: Validate frontend deployment variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in AWS_ROLE_ARN AWS_REGION FRONTEND_BUCKET CLOUDFRONT_DISTRIBUTION_ID; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "GitHub variable ${variable} is required." >&2
+              exit 1
+            fi
+          done
+
+      # Access Keyを保存せずOIDCでDEV用AWS Roleへ接続する
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # build済みdistをS3へ同期し、古い不要ファイルを削除する
+      - name: Sync frontend to S3
+        run: aws s3 sync frontend-dist "s3://${FRONTEND_BUCKET}" --delete
+
+      # CloudFrontのキャッシュを無効化して新しい画面を配信する
+      - name: Invalidate CloudFront cache
+        run: aws cloudfront create-invalidation --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" --paths '/*'
+
+  # Buildがmainへのpushで成功した場合だけ、作成済みイメージをDEV ECSへ配信する
+  backend:
+    name: Deploy backend to DEV
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: dev
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+      ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+      ECS_CONTAINER: ${{ vars.ECS_CONTAINER }}
+      # Build対象だったcommit SHAをECRのイメージタグとして使用する
+      IMAGE_TAG: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      # 必須のDEV環境変数が設定されていることを確認する
+      - name: Validate backend deployment variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in AWS_ROLE_ARN AWS_REGION ECR_REPOSITORY ECS_CLUSTER ECS_SERVICE ECS_CONTAINER IMAGE_TAG; do
+            if [[ -z "${!variable:-}" ]]; then
+              echo "GitHub variable ${variable} is required." >&2
+              exit 1
+            fi
+          done
+
+      # Access Keyを保存せずOIDCでDEV用AWS Roleへ接続する
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ECRレジストリURLを取得する
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # build.ymlがpushしたイメージを検索し、改変不能なdigest URIを作る
+      - name: Resolve built image digest
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest=""
+          for attempt in {1..10}; do
+            digest="$(aws ecr describe-images \
+              --repository-name "$ECR_REPOSITORY" \
+              --image-ids imageTag="$IMAGE_TAG" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text 2>/dev/null || true)"
+            [[ "$digest" == sha256:* ]] && break
+            sleep 3
+          done
+
+          if [[ "$digest" != sha256:* ]]; then
+            echo "Could not resolve an image digest for ${IMAGE_TAG}." >&2
+            exit 1
+          fi
+
+          echo "image_uri=${ECR_REGISTRY}/${ECR_REPOSITORY}@${digest}" >> "$GITHUB_OUTPUT"
+
+      # 最新の基本設定を引き継ぎ、イメージだけを更新したrevisionを登録する
+      - name: Register task definition revision
+        id: task-definition
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          service_json="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --output json)"
+
+          if [[ "$(jq '.failures | length' <<< "$service_json")" -ne 0 ]] || \
+             [[ "$(jq '.services | length' <<< "$service_json")" -ne 1 ]]; then
+            echo "The DEV ECS service could not be resolved." >&2
+            exit 1
+          fi
+
+          current_task_definition="$(jq -r '.services[0].taskDefinition' <<< "$service_json")"
+          current_task_definition_json="$(aws ecs describe-task-definition \
+            --task-definition "$current_task_definition" \
+            --output json)"
+          task_family="$(jq -r '.taskDefinition.family' <<< "$current_task_definition_json")"
+          base_task_definition="$(aws ecs list-task-definitions \
+            --family-prefix "$task_family" \
+            --status ACTIVE \
+            --sort DESC \
+            --max-items 1 \
+            --query 'taskDefinitionArns[0]' \
+            --output text)"
+          if [[ "$base_task_definition" != arn:aws*:ecs:*:task-definition/*:* ]]; then
+            echo "The latest DEV task definition could not be resolved." >&2
+            exit 1
+          fi
+
+          aws ecs describe-task-definition \
+            --task-definition "$base_task_definition" \
+            --include TAGS \
+            --output json > task-definition-response.json
+          jq '.taskDefinition + {tags: (.tags // [])}' \
+            task-definition-response.json > task-definition.json
+
+          if ! jq -e --arg container "$ECS_CONTAINER" \
+            '[.containerDefinitions[] | select(.name == $container)] | length == 1' \
+            task-definition.json > /dev/null; then
+            echo "Container ${ECS_CONTAINER} was not found exactly once." >&2
+            exit 1
+          fi
+
+          jq --arg container "$ECS_CONTAINER" --arg image "$IMAGE_URI" '
+            del(
+              .taskDefinitionArn,
+              .revision,
+              .status,
+              .requiresAttributes,
+              .compatibilities,
+              .registeredAt,
+              .registeredBy,
+              .deregisteredAt
+            )
+            | .containerDefinitions |= map(
+                if .name == $container then .image = $image else . end
+              )
+          ' task-definition.json > task-definition-new.json
+
+          task_definition_arn="$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition-new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)"
+          if [[ "$task_definition_arn" != arn:aws*:ecs:*:task-definition/*:* ]]; then
+            echo "ECS did not return a valid task definition ARN." >&2
+            exit 1
+          fi
+          echo "arn=${task_definition_arn}" >> "$GITHUB_OUTPUT"
+
+      # 常駐タスクを切り替える前に、同じrevisionでDB migrationを1回だけ実行する
+      - name: Run database migrations
+        env:
+          TASK_DEFINITION_ARN: ${{ steps.task-definition.outputs.arn }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          service_json="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --output json)"
+          network_configuration="$(jq -c '.services[0].networkConfiguration' <<< "$service_json")"
+          overrides="$(jq -nc --arg container "$ECS_CONTAINER" \
+            '{containerOverrides: [{name: $container, command: ["php", "artisan", "migrate", "--force"]}]}')"
+
+          run_result="$(aws ecs run-task \
+            --cluster "$ECS_CLUSTER" \
+            --task-definition "$TASK_DEFINITION_ARN" \
+            --launch-type FARGATE \
+            --network-configuration "$network_configuration" \
+            --overrides "$overrides" \
+            --output json)"
+          if [[ "$(jq '.failures | length' <<< "$run_result")" -ne 0 ]]; then
+            jq '.failures' <<< "$run_result" >&2
+            exit 1
+          fi
+
+          task_arn="$(jq -r '.tasks[0].taskArn // empty' <<< "$run_result")"
+          if [[ -z "$task_arn" ]]; then
+            echo "Migration task was not started." >&2
+            exit 1
+          fi
+
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$task_arn"
+          task_result="$(aws ecs describe-tasks \
+            --cluster "$ECS_CLUSTER" \
+            --tasks "$task_arn" \
+            --output json)"
+          exit_code="$(jq -r --arg container "$ECS_CONTAINER" \
+            '.tasks[0].containers[] | select(.name == $container) | .exitCode // -1' \
+            <<< "$task_result")"
+          if [[ "$exit_code" -ne 0 ]]; then
+            jq '.tasks[0] | {stoppedReason, containers}' <<< "$task_result" >&2
+            exit 1
+          fi
+
+      # DEVサービスを新しいタスク定義へ切り替える
+      - name: Update ECS service
+        env:
+          TASK_DEFINITION_ARN: ${{ steps.task-definition.outputs.arn }}
+        run: |
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --task-definition "$TASK_DEFINITION_ARN" \
+            --desired-count 1
+          aws ecs wait services-stable \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE"
+
+      # DEVが今回作成したrevisionで安定稼働していることを確認する
+      - name: Verify deployment
+        env:
+          EXPECTED_TASK_DEFINITION_ARN: ${{ steps.task-definition.outputs.arn }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          service_json="$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --output json)"
+          actual_task_definition="$(jq -r '.services[0].taskDefinition' <<< "$service_json")"
+          primary_task_definition="$(jq -r '.services[0].deployments[] | select(.status == "PRIMARY") | .taskDefinition' <<< "$service_json")"
+          rollout_state="$(jq -r '.services[0].deployments[] | select(.status == "PRIMARY") | .rolloutState // "UNKNOWN"' <<< "$service_json")"
+
+          if [[ "$actual_task_definition" != "$EXPECTED_TASK_DEFINITION_ARN" ]] || \
+             [[ "$primary_task_definition" != "$EXPECTED_TASK_DEFINITION_ARN" ]] || \
+             [[ "$rollout_state" != "COMPLETED" ]]; then
+            echo "DEV ECS service is not running the expected revision." >&2
+            exit 1
+          fi
