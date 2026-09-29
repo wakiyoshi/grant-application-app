@@ -59,6 +59,7 @@ jobs:
   backend-test:
     name: Test backend
     runs-on: ubuntu-latest
+    environment: dev
     defaults:
       run:
         working-directory: backend
@@ -93,6 +94,7 @@ jobs:
     if: github.event_name == 'push'
     needs: [frontend, backend-test]
     runs-on: ubuntu-latest
+    environment: dev
     permissions:
       contents: read
       # GitHub OIDCでAWS IAM Roleを引き受けるために必要
