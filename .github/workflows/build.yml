@@ -99,7 +99,7 @@ jobs:
       # GitHub OIDCでAWS IAM Roleを引き受けるために必要
       id-token: write
     env:
-      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_ROLE_ARN: ${{ vars.DEV_AWS_ROLE_ARN }}
       AWS_REGION: ${{ vars.AWS_REGION }}
       ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
     steps:

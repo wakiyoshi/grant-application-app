@@ -29,7 +29,7 @@ jobs:
     # 直前環境のVariablesとOIDC subjectを使用する
     environment: ${{ inputs.target_environment == 'stg' && 'dev' || 'stg' }}
     env:
-      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_ROLE_ARN: ${{ vars[inputs.target_environment == 'stg' && 'DEV_AWS_ROLE_ARN' || 'STG_AWS_ROLE_ARN'] }}
       AWS_REGION: ${{ vars.AWS_REGION }}
       ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
       ECS_SERVICE: ${{ vars.ECS_SERVICE }}
@@ -101,7 +101,7 @@ jobs:
     timeout-minutes: 30
     environment: ${{ inputs.target_environment }}
     env:
-      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_ROLE_ARN: ${{ vars[inputs.target_environment == 'stg' && 'STG_AWS_ROLE_ARN' || 'PROD_AWS_ROLE_ARN'] }}
       AWS_REGION: ${{ vars.AWS_REGION }}
       ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
       ECS_SERVICE: ${{ vars.ECS_SERVICE }}

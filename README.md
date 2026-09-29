@@ -199,7 +199,12 @@ GitHub Environments `dev`、`stg`、`prod`へ以下を設定します。STG/PROD
 
 各Environment用Variables:
 
-- `AWS_ROLE_ARN`: GitHub OIDCでAssumeする環境別IAM Role ARN
+- OIDCロールは各EnvironmentのVariablesに環境別の名前で設定する:
+  - `dev`: `DEV_AWS_ROLE_ARN`
+  - `stg`: `STG_AWS_ROLE_ARN`
+  - `prod`: `PROD_AWS_ROLE_ARN`
+  - 値はそれぞれの環境のIAM Role ARN。共通の `AWS_ROLE_ARN` は参照しない。
+  - BuildとDeploy DEVはDEVロールを使用する。PromoteはSTGへの昇格時にDEV→STG、PRODへの昇格時にSTG→PRODのロールを使用する。
 - `AWS_REGION`, `ECS_CLUSTER`, `ECS_SERVICE`, `ECS_CONTAINER`
 - DEVのみ: `ECR_REPOSITORY`, `FRONTEND_BUCKET`, `CLOUDFRONT_DISTRIBUTION_ID`
 

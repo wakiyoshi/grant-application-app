@@ -6,7 +6,7 @@ The application repository builds the Backend image in `build.yml` and deploys t
 
 Configure these variables in the `dev` GitHub Environment (or as repository variables):
 
-- `AWS_ROLE_ARN`: IAM role assumed by GitHub Actions through OIDC
+- `DEV_AWS_ROLE_ARN`: DEV IAM role assumed by GitHub Actions through OIDC. Set `STG_AWS_ROLE_ARN` in the `stg` Environment and `PROD_AWS_ROLE_ARN` in the `prod` Environment for promotion. Workflows do not read the shared `AWS_ROLE_ARN` variable.
 - `AWS_REGION`: region containing ECR and ECS
 - `ECR_REPOSITORY`: ECR repository name, not a registry URL
 - `ECS_CLUSTER`: DEV ECS cluster name or ARN

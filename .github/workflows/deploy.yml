@@ -32,7 +32,7 @@ jobs:
     # 環境ごとに管理できる
     environment: dev
     env:
-      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_ROLE_ARN: ${{ vars.DEV_AWS_ROLE_ARN }}
       AWS_REGION: ${{ vars.AWS_REGION }}
       FRONTEND_BUCKET: ${{ vars.FRONTEND_BUCKET }}
       CLOUDFRONT_DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
@@ -83,7 +83,7 @@ jobs:
     timeout-minutes: 30
     environment: dev
     env:
-      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      AWS_ROLE_ARN: ${{ vars.DEV_AWS_ROLE_ARN }}
       AWS_REGION: ${{ vars.AWS_REGION }}
       ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
       ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
