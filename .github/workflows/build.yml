@@ -16,6 +16,7 @@ jobs:
   frontend:
     name: Lint and build frontend
     runs-on: ubuntu-latest
+    environment: dev
     defaults:
       run:
         working-directory: frontend
@@ -92,8 +93,6 @@ jobs:
     if: github.event_name == 'push'
     needs: [frontend, backend-test]
     runs-on: ubuntu-latest
-    # DEV環境のVariablesとOIDC subjectを使用する
-    environment: dev
     permissions:
       contents: read
       # GitHub OIDCでAWS IAM Roleを引き受けるために必要
